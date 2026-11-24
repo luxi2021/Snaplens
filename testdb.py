@@ -1,0 +1,248 @@
+"""
+Test-db.py — SQLite persistence layer for Snaplens.
+
+Tables
+------
+users       : authenticated accounts (engineer / reviewer / admin)
+snapshots   : filesystem diffs captured from hosts, with review state
+audit_logs  : append-only record of security-relevant events
+
+Conventions
+-----------
+* All timestamps are stored as UTC ISO-8601 strings (see `utc_now_iso`).
+* Foreign keys are enforced on every connection.
+* "Credentials check" helpers intentionally return None for both
+  unknown-user and bad-password so callers cannot enumerate usernames.
+"""
+from __future__ import annotations
+
+import os
+import sqlite3
+from datetime import datetime, timezone
+
+from werkzeug.security import check_password_hash, generate_password_hash
+
+DEFAULT_DB_PATH = os.environ.get("SNAPLENS_DB_PATH", "snaplens.db")
+VALID_ROLES = ("engineer", "reviewer", "admin")
+
+# Selected whenever we load a user. Kept in one place so the two
+# get_user_* functions can never drift apart.
+_USER_COLUMNS = "id, username, password_hash, role, is_active, created_at"
+
+
+# --------------------------------------------------------------------------- #
+# Low-level helpers
+# --------------------------------------------------------------------------- #
+
+def utc_now_iso() -> str:
+    """Return the current UTC time as a timezone-aware ISO-8601 string."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    """Open a connection with row access by name and foreign keys enforced."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+
+# --------------------------------------------------------------------------- #
+# Schema
+# --------------------------------------------------------------------------- #
+
+def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
+    """Create all tables and indexes if they do not already exist."""
+    schema_sql = """
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('engineer', 'reviewer', 'admin')),
+        is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        host_label TEXT NOT NULL,
+        snapshot_tag TEXT NOT NULL,
+        captured_by INTEGER NOT NULL,
+        parent_snapshot_id INTEGER,
+        added_count INTEGER NOT NULL DEFAULT 0,
+        modified_count INTEGER NOT NULL DEFAULT 0,
+        removed_count INTEGER NOT NULL DEFAULT 0,
+        diff_json TEXT NOT NULL DEFAULT '{}',
+        review_status TEXT NOT NULL DEFAULT 'pending_review'
+            CHECK (review_status IN ('pending_review', 'approved', 'flagged', 'remediated')),
+        reviewed_by INTEGER,
+        review_notes TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (captured_by) REFERENCES users (id),
+        FOREIGN KEY (parent_snapshot_id) REFERENCES snapshots (id),
+        FOREIGN KEY (reviewed_by) REFERENCES users (id)
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor_id INTEGER,
+        actor_username TEXT NOT NULL,
+        actor_role TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT,
+        details TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (actor_id) REFERENCES users (id)
+    );
+
+    -- Supports "list recent snapshots for a host" queries.
+    CREATE INDEX IF NOT EXISTS idx_snapshots_host_created
+        ON snapshots (host_label, created_at);
+
+    -- Supports time-ordered audit-log browsing.
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_created
+        ON audit_logs (created_at);
+    """
+    with get_connection(db_path) as conn:
+        conn.executescript(schema_sql)
+
+
+# --------------------------------------------------------------------------- #
+# Users
+# --------------------------------------------------------------------------- #
+
+def create_user(
+    username: str,
+    password: str,
+    role: str,
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    """Create a user and return the new row id. Raises ValueError on bad input."""
+    clean_username = username.strip()
+    if not clean_username or len(password) < 8:
+        raise ValueError("Username is required and password must be at least 8 characters.")
+    if role not in VALID_ROLES:
+        raise ValueError(f"Invalid role '{role}'. Expected one of {VALID_ROLES}.")
+
+    password_hash = generate_password_hash(password)
+    now = utc_now_iso()
+
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO users (username, password_hash, role, is_active, created_at)
+            VALUES (?, ?, ?, 1, ?)
+            """,
+            (clean_username, password_hash, role, now),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_user_by_username(username: str, db_path: str = DEFAULT_DB_PATH) -> sqlite3.Row | None:
+    """Fetch a user by username (case-sensitive, whitespace trimmed)."""
+    with get_connection(db_path) as conn:
+        return conn.execute(
+            f"SELECT {_USER_COLUMNS} FROM users WHERE username = ?",
+            (username.strip(),),
+        ).fetchone()
+
+
+def get_user_by_id(user_id: int, db_path: str = DEFAULT_DB_PATH) -> sqlite3.Row | None:
+    """Fetch a user by primary key."""
+    with get_connection(db_path) as conn:
+        return conn.execute(
+            f"SELECT {_USER_COLUMNS} FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+
+
+def set_user_password(
+    username: str,
+    new_password: str,
+    db_path: str = DEFAULT_DB_PATH,
+) -> bool:
+    """
+    Replace a user's password hash. Returns True if a row was updated.
+
+    Useful for rotating demo credentials without deleting the database.
+    """
+    if len(new_password) < 8:
+        raise ValueError("Password must be at least 8 characters.")
+
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE users SET password_hash = ? WHERE username = ?",
+            (generate_password_hash(new_password), username.strip()),
+        )
+        return cursor.rowcount > 0
+
+
+def verify_user_credentials(
+    username: str,
+    password: str,
+    db_path: str = DEFAULT_DB_PATH,
+) -> sqlite3.Row | None:
+    """
+    Return the user row if the password matches AND the account is active.
+
+    Returning None for both "no such user" and "wrong password" prevents
+    callers (and attackers) from distinguishing the two cases.
+    """
+    user = get_user_by_username(username, db_path=db_path)
+    if user is None or user["is_active"] != 1:
+        return None
+    return user if check_password_hash(user["password_hash"], password) else None
+
+
+# --------------------------------------------------------------------------- #
+# Audit log
+# --------------------------------------------------------------------------- #
+
+def log_audit_event(
+    actor_id: int | None,
+    actor_username: str,
+    actor_role: str,
+    action: str,
+    target_type: str,
+    target_id: str | None = None,
+    details: str | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    """Append one audit-log row. Never raises on missing optional fields."""
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_logs (
+                actor_id, actor_username, actor_role, action,
+                target_type, target_id, details, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (actor_id, actor_username, actor_role, action,
+             target_type, target_id, details, utc_now_iso()),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Demo seeding
+# --------------------------------------------------------------------------- #
+
+def seed_default_users(db_path: str = DEFAULT_DB_PATH) -> None:
+    """
+    Create the three demo accounts if they don't exist yet.
+
+    Passwords are read from environment variables. The hardcoded fallbacks
+    exist only for local development — replace them (or delete this function)
+    before any shared deployment.
+    """
+    seed_accounts = [
+        ("eng_demo",   "SNAPLENS_ENG_PASS",   "E#g|N@*r0!", "engineer"),
+        ("rev_demo",   "SNAPLENS_REV_PASS",   "R@vI#w$1%",  "reviewer"),
+        ("admin_demo", "SNAPLENS_ADMIN_PASS", "@D!%$n2*",   "admin"),
+    ]
+    for username, env_var, fallback, role in seed_accounts:
+        if get_user_by_username(username, db_path=db_path) is None:
+            password = os.environ.get(env_var, fallback)
+            create_user(username, password, role, db_path=db_path)
