@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import json
 from datetime import datetime, timezone
 
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -45,6 +46,114 @@ def get_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
+
+# This part of code helps to save snapshots using parameterized queries in a reliable and safe fashion
+# These are termed as SQLite helpers used for retrieving particular snapshots using id / target path. -- Version 2
+def create_snap(
+    host_label,
+    snapshot_tag,
+    captured_by,
+    parent_snapshot_id=None,
+    added_count=0,
+    modified_count=0,
+    removed_count=0,
+    diff_json="{}",
+    review_status: str = "pending_review",
+    reviewed_by=None,
+    review_notes="",
+):
+    now = utc_now_iso()
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO snapshots (
+                host_label, snapshot_tag, captured_by, parent_snapshot_id,
+                added_count, modified_count, removed_count, diff_json,
+                review_status, reviewed_by, review_notes, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                host_label, snapshot_tag, captured_by, parent_snapshot_id,
+                int(added_count), int(modified_count), int(removed_count),
+                diff_json, review_status, reviewed_by, review_notes,
+                now, now,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_snapshot_by_id(snapshot_id):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM snapshots WHERE id = ?", (int(snapshot_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def latest_snap_for_host(host_label):
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM snapshots
+            WHERE host_label = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (host_label,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_snapshot(host_label=None, limit=50):
+    # clamp — a caller asking for 10000 rows would be rude
+    limit = max(1, min(int(limit), 500))
+    with get_connection() as conn:
+        if host_label:
+            rows = conn.execute(
+                "SELECT * FROM snapshots WHERE host_label = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (host_label, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM snapshots ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_snapshot_reviews(snapshot_id, review_status, reviewed_by, review_notes=""):
+    now = utc_now_iso()
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE snapshots
+            SET review_status = ?,
+                reviewed_by = ?,
+                review_notes = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (review_status, reviewed_by, review_notes, now, int(snapshot_id)),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    
+# This part of code helps to reconstruct lines safely while the app compares a newly taken snapshot with an earlier snapshot.
+# *Version 3*
+def extract_snap_lines(snapshot_row: dict | None) -> list[str]:
+    """Extract stored normalized config lines from a snapshot row's diff_json."""
+    if not snapshot_row:
+        return []
+    raw_diff = snapshot_row.get("diff_json") or "{}"
+    try:
+        parsed = json.loads(raw_diff)
+    except (TypeError, ValueError):
+        return []
+    if isinstance(parsed, dict) and isinstance(parsed.get("lines"), list): # if previous snapshot exists
+        return [str(line) for line in parsed["lines"]]
+    return []
 
 
 # --------------------------------------------------------------------------- #
