@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Snaplens — Sign In</title>
+</head>
+<body>
+  <h1>Snaplens — Configuration Drift &amp; Audit Portal</h1>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <ul>
+        {% for category, message in messages %}
+          <li><strong>{{ category|upper }}:</strong> {{ message }}</li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  {% endwith %}
+
+  <form method="POST" action="{{ url_for('auth.login', next=request.args.get('next', '')) }}">
+    {{ form.hidden_tag() }}
+    <p>
+      {{ form.username.label }}<br />
+      {{ form.username(size=32) }}
+    </p>
+    <p>
+      {{ form.password.label }}<br />
+      {{ form.password(size=32) }}
+    </p>
+    <p>
+      <button type="submit">{{ form.submit.label.text }}</button>
+    </p>
+  </form>
+</body>
+</html>

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Snaplens — {{ section }}</title>
+</head>
+<body>
+  <h1>Snaplens — {{ section }}</h1>
+  <p>Signed in as: <strong>{{ user["username"] }}</strong> | Role: <strong>{{ user["role"] }}</strong></p>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <ul>
+        {% for category, message in messages %}
+          <li><strong>{{ category|upper }}:</strong> {{ message }}</li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  {% endwith %}
+
+  <nav>
+    <ul>
+      <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
+      <li><a href="{{ url_for('engineer_capture') }}">Engineer Area (engineer/admin)</a></li>
+      <li><a href="{{ url_for('reviewer_queue') }}">Reviewer Area (reviewer/admin)</a></li>
+      <li><a href="{{ url_for('admin_users') }}">Admin Area (admin only)</a></li>
+    </ul>
+  </nav>
+
+  <form method="POST" action="{{ url_for('auth.logout') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+    <button type="submit">Sign Out</button>
+  </form>
+</body>
+</html>
